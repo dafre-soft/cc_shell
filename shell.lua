@@ -1,228 +1,72 @@
--- ComputerCraft Advanced Shell with GUI
--- Save as "shell.lua" and run
+-- Advanced Shell for ComputerCraft (CC:Tweaked)
+-- Features: Modem support, Display support, GUI interface, Background tasks, Command history
 
+local shell = {}
+local version = "2.0.0"
+
+-- ============================================================================
 -- Configuration
+-- ============================================================================
 local config = {
     prompt = "> ",
     historyFile = ".shell_history",
-    maxHistory = 50,
-    modemPort = 12345
+    maxHistory = 100,
+    modemPort = 12345,
+    guiEnabled = true,
+    guiWidth = 50,
+    guiHeight = 20
 }
 
--- GUI Colors
-local colors = {
-    background = colors.black,
-    text = colors.white,
-    prompt = colors.lime,
-    error = colors.red,
-    success = colors.green,
-    info = colors.cyan,
-    border = colors.gray
-}
-
--- State
+-- ============================================================================
+-- Global State
+-- ============================================================================
 local state = {
     running = true,
     currentDir = shell.dir(),
     history = {},
     historyIndex = 0,
-    currentInput = "",
-    cursorPos = 0,
-    scrollOffset = 0,
-    outputLines = {},
-    maxOutputLines = 100,
+    backgroundJobs = {},
+    nextJobId = 1,
     modem = nil,
+    modemSide = nil,
     display = nil,
-    displayMonitor = nil,
-    termW = 0,
-    termH = 0,
-    currentX = 0,
-    currentY = 0
+    displaySide = nil,
+    guiWindow = nil,
+    guiMonitor = nil,
+    outputBuffer = {},
+    inputBuffer = "",
+    cursorPos = 0,
+    scrollOffset = 0
 }
 
--- GUI Functions
-local function setColor(color)
-    term.setTextColor(color)
-end
-
-local function setBgColor(color)
-    term.setBackgroundColor(color)
-end
-
-local function clearScreen()
-    term.clear()
-    setColor(colors.text)
-    setBgColor(colors.background)
-    term.setCursorPos(1, 1)
-end
-
-local function drawBorder()
-    local w, h = term.getSize()
-    setColor(colors.border)
-    for x = 1, w do
-        term.setCursorPos(x, 1)
-        term.write("=")
-        term.setCursorPos(x, h)
-        term.write("=")
+-- ============================================================================
+-- Helper Functions
+-- ============================================================================
+local function splitString(str, delimiter)
+    delimiter = delimiter or "%s"
+    local result = {}
+    for match in string.gmatch(str, "[^" .. delimiter .. "]+") do
+        table.insert(result, match)
     end
-    for y = 2, h-1 do
-        term.setCursorPos(1, y)
-        term.write("|")
-        term.setCursorPos(w, y)
-        term.write("|")
-    end
-    setColor(colors.text)
+    return result
 end
 
-local function drawStatusBar()
-    local w, h = term.getSize()
-    term.setCursorPos(2, h)
-    setColor(colors.info)
-    term.write(" Modem:" .. (state.modem and "ON" or "OFF"))
-    term.write(" | Display:" .. (state.display and "ON" or "OFF"))
-    term.write(" | Dir:" .. state.currentDir)
-    
-    -- Show clock
-    local timeText = textutils.formatTime(os.time(), false)
-    term.setCursorPos(w - #timeText - 2, h)
-    term.write(timeText)
-    
-    setColor(colors.text)
-end
-
-local function scrollOutput()
-    local w, h = term.getSize()
-    local outputArea = h - 3 -- Leave space for prompt and status
-    
-    term.setCursorPos(2, 2)
-    
-    -- Calculate visible lines
-    local visibleLines = {}
-    for i = #state.outputLines - state.scrollOffset, 1, -1 do
-        table.insert(visibleLines, 1, state.outputLines[i])
-        if #visibleLines >= outputArea then break end
-    end
-    
-    -- Clear output area
-    for y = 2, h-2 do
-        term.setCursorPos(2, y)
-        term.write(string.rep(" ", w-2))
-    end
-    
-    -- Draw visible lines
-    term.setCursorPos(2, 2)
-    for i, line in ipairs(visibleLines) do
-        if i <= outputArea then
-            term.setCursorPos(2, 1 + i)
-            local displayLine = line
-            if #displayLine > w - 3 then
-                displayLine = displayLine:sub(1, w-6) .. "..."
-            end
-            term.write(displayLine)
-            term.write(string.rep(" ", w - #displayLine - 3))
+local function tableToString(tbl, indent)
+    indent = indent or 0
+    local str = ""
+    for k, v in pairs(tbl) do
+        if type(v) == "table" then
+            str = str .. string.rep("  ", indent) .. tostring(k) .. ": {\n" .. tableToString(v, indent + 1) .. string.rep("  ", indent) .. "}\n"
+        else
+            str = str .. string.rep("  ", indent) .. tostring(k) .. ": " .. tostring(v) .. "\n"
         end
     end
+    return str
 end
 
-local function addOutput(text, color)
-    if color then
-        setColor(color)
-    else
-        setColor(colors.text)
-    end
-    
-    -- Split long lines
-    local w, h = term.getSize()
-    local lines = {}
-    while #text > w - 4 do
-        local line = text:sub(1, w-4)
-        table.insert(lines, line)
-        text = text:sub(w-3)
-    end
-    table.insert(lines, text)
-    
-    for _, line in ipairs(lines) do
-        table.insert(state.outputLines, line)
-        if #state.outputLines > state.maxOutputLines then
-            table.remove(state.outputLines, 1)
-        end
-    end
-    
-    scrollOutput()
-    setColor(colors.text)
-end
-
--- Input handling with cursor
-local function drawPrompt()
-    local w, h = term.getSize()
-    term.setCursorPos(2, h-1)
-    setColor(colors.prompt)
-    term.write(config.prompt)
-    setColor(colors.text)
-    term.write(state.currentInput)
-    term.write(string.rep(" ", w - #config.prompt - #state.currentInput - 2))
-    term.setCursorPos(2 + #config.prompt + state.cursorPos, h-1)
-end
-
-local function clearInputLine()
-    local w, h = term.getSize()
-    term.setCursorPos(2, h-1)
-    term.write(string.rep(" ", w-2))
-end
-
--- Modem functions
-local function initModem()
-    if peripheral.find("modem") then
-        state.modem = peripheral.find("modem")
-        state.modem.open(config.modemPort)
-        addOutput("[System] Modem initialized on port " .. config.modemPort, colors.success)
-        return true
-    else
-        addOutput("[System] No modem found", colors.error)
-        return false
-    end
-end
-
-local function sendModemMessage(target, port, message)
-    if state.modem then
-        state.modem.transmit(port, target, message)
-        addOutput("[Modem] Sent to " .. target .. ":" .. port .. " -> " .. message, colors.info)
-        return true
-    else
-        addOutput("[Modem] No modem available", colors.error)
-        return false
-    end
-end
-
--- Display functions
-local function initDisplay()
-    for _, side in ipairs(peripheral.getNames()) do
-        local p = peripheral.wrap(side)
-        if p.getType and p.getType() == "monitor" then
-            state.display = p
-            state.display.setTextColor(colors.white)
-            state.display.setBackgroundColor(colors.black)
-            state.display.clear()
-            state.display.setCursorPos(1, 1)
-            state.display.write("=== ComputerCraft Shell ===")
-            addOutput("[System] Display connected on " .. side, colors.success)
-            return true
-        end
-    end
-    addOutput("[System] No display found", colors.warning)
-    return false
-end
-
-local function writeToDisplay(text, x, y)
-    if state.display then
-        if x and y then
-            state.display.setCursorPos(x, y)
-        end
-        state.display.write(text)
-    end
-end
-
--- History functions
+-- ============================================================================
+- History Management
+-- ============================================================================
 local function loadHistory()
     if fs.exists(config.historyFile) then
         local file = fs.open(config.historyFile, "r")
@@ -233,6 +77,10 @@ local function loadHistory()
                 table.insert(state.history, line)
             end
             file.close()
+            
+            while #state.history > config.maxHistory do
+                table.remove(state.history, 1)
+            end
             state.historyIndex = #state.history
         end
     end
@@ -241,66 +89,309 @@ end
 local function saveHistory()
     local file = fs.open(config.historyFile, "w")
     if file then
-        for i = math.max(1, #state.history - config.maxHistory), #state.history do
-            file.writeLine(state.history[i])
+        for _, cmd in ipairs(state.history) do
+            file.writeLine(cmd)
         end
         file.close()
     end
 end
 
 local function addToHistory(cmd)
-    if cmd ~= "" and (#state.history == 0 or state.history[#state.history] ~= cmd) then
-        table.insert(state.history, cmd)
-        if #state.history > config.maxHistory then
-            table.remove(state.history, 1)
+    if cmd ~= "" then
+        if #state.history == 0 or state.history[#state.history] ~= cmd then
+            table.insert(state.history, cmd)
+            while #state.history > config.maxHistory do
+                table.remove(state.history, 1)
+            end
+            state.historyIndex = #state.history
+            saveHistory()
         end
-        state.historyIndex = #state.history
-        saveHistory()
     end
 end
 
--- Built-in commands
+-- ============================================================================
+-- Output Management
+-- ============================================================================
+local function addOutput(text)
+    local lines = {}
+    for line in string.gmatch(text, "[^\r\n]+") do
+        table.insert(state.outputBuffer, line)
+    end
+    
+    -- Limit buffer size
+    while #state.outputBuffer > 1000 do
+        table.remove(state.outputBuffer, 1)
+    end
+    
+    -- Auto-scroll to bottom
+    state.scrollOffset = 0
+    
+    if not config.guiEnabled or not state.guiWindow then
+        print(text)
+    end
+end
+
+local function clearOutput()
+    state.outputBuffer = {}
+    state.scrollOffset = 0
+    if config.guiEnabled and state.guiWindow then
+        state.guiWindow.clear()
+        state.guiWindow.setCursorPos(1, 1)
+    else
+        term.clear()
+        term.setCursorPos(1, 1)
+    end
+end
+
+-- ============================================================================
+-- Modem Functions
+-- ============================================================================
+local function initModem()
+    local sides = peripheral.getNames()
+    for _, side in ipairs(sides) do
+        local p = peripheral.wrap(side)
+        if p and p.isWirelessModem and p.isWirelessModem() then
+            state.modem = p
+            state.modemSide = side
+            state.modem.open(config.modemPort)
+            addOutput("[Shell] Modem initialized on side '" .. side .. "', port " .. config.modemPort)
+            return true
+        end
+    end
+    addOutput("[Shell] No modem found")
+    return false
+end
+
+local function modemSend(target, port, message)
+    if state.modem then
+        state.modem.transmit(port, target, message)
+        addOutput("[Modem] Sent to " .. tostring(target) .. ":" .. port .. " -> " .. message)
+        return true
+    else
+        addOutput("[Modem] Modem not available")
+        return false
+    end
+end
+
+-- ============================================================================
+-- Display Functions
+-- ============================================================================
+local function initDisplay()
+    local sides = peripheral.getNames()
+    for _, side in ipairs(sides) do
+        local p = peripheral.wrap(side)
+        if p and p.getSize then
+            state.display = p
+            state.displaySide = side
+            local w, h = state.display.getSize()
+            addOutput("[Shell] Display initialized on side '" .. side .. "' (" .. w .. "x" .. h .. ")")
+            return true
+        end
+    end
+    addOutput("[Shell] No display found")
+    return false
+end
+
+local function displayWrite(text, x, y)
+    if state.display then
+        if x and y then
+            state.display.setCursorPos(x, y)
+        end
+        state.display.write(text)
+    end
+end
+
+local function displayClear()
+    if state.display then
+        state.display.clear()
+    end
+end
+
+-- ============================================================================
+-- GUI Functions
+-- ============================================================================
+local function drawGUI()
+    if not config.guiEnabled or not state.guiWindow then
+        return
+    end
+    
+    local w, h = state.guiWindow.getSize()
+    
+    -- Draw title bar
+    state.guiWindow.setBackgroundColor(colors.blue)
+    state.guiWindow.setTextColor(colors.white)
+    state.guiWindow.clearLine()
+    state.guiWindow.setCursorPos(1, 1)
+    local title = " Advanced Shell v" .. version .. " "
+    state.guiWindow.write(title .. string.rep(" ", w - #title - 5))
+    state.guiWindow.write("[X]")
+    
+    -- Draw status bar
+    state.guiWindow.setBackgroundColor(colors.black)
+    state.guiWindow.setTextColor(colors.lightGray)
+    state.guiWindow.setCursorPos(1, h)
+    local status = " Dir: " .. state.currentDir .. " "
+    local modemStatus = state.modem and "Modem:ON " or "Modem:OFF "
+    local jobCount = 0
+    for _ in pairs(state.backgroundJobs) do jobCount = jobCount + 1 end
+    local jobsStatus = "Jobs:" .. jobCount .. " "
+    local fullStatus = status .. modemStatus .. jobsStatus
+    state.guiWindow.write(fullStatus .. string.rep(" ", w - #fullStatus))
+    
+    -- Draw separator lines
+    state.guiWindow.setBackgroundColor(colors.gray)
+    for x = 1, w do
+        state.guiWindow.setCursorPos(x, 2)
+        state.guiWindow.write("─")
+        state.guiWindow.setCursorPos(x, h - 1)
+        state.guiWindow.write("─")
+    end
+    
+    -- Draw output area (lines 3 to h-2)
+    state.guiWindow.setBackgroundColor(colors.black)
+    state.guiWindow.setTextColor(colors.white)
+    
+    local outputHeight = h - 4
+    local startIdx = #state.outputBuffer - outputHeight + 1 - state.scrollOffset
+    if startIdx < 1 then startIdx = 1 end
+    
+    for i = 1, outputHeight do
+        state.guiWindow.setCursorPos(1, 2 + i)
+        state.guiWindow.clearLine()
+        local lineIdx = startIdx + i - 1
+        if lineIdx <= #state.outputBuffer then
+            local line = state.outputBuffer[lineIdx]
+            if #line > w - 2 then
+                line = line:sub(1, w - 5) .. "..."
+            end
+            state.guiWindow.write(" " .. line)
+        end
+    end
+    
+    -- Draw input line
+    state.guiWindow.setCursorPos(1, h - 1)
+    state.guiWindow.setBackgroundColor(colors.black)
+    state.guiWindow.setTextColor(colors.yellow)
+    state.guiWindow.write(" ")
+    state.guiWindow.setBackgroundColor(colors.black)
+    state.guiWindow.setTextColor(colors.white)
+    state.guiWindow.write(config.prompt)
+    state.guiWindow.setTextColor(colors.yellow)
+    state.guiWindow.write(state.inputBuffer)
+    state.guiWindow.clearLine()
+    
+    -- Position cursor
+    local cursorX = 2 + #config.prompt + state.cursorPos
+    if cursorX > w then cursorX = w end
+    state.guiWindow.setCursorPos(cursorX, h - 1)
+end
+
+local function initGUI()
+    if not config.guiEnabled then
+        return false
+    end
+    
+    local sides = peripheral.getNames()
+    for _, side in ipairs(sides) do
+        local p = peripheral.wrap(side)
+        if p and p.getSize and p.getSize() then
+            state.guiMonitor = p
+            local w, h = state.guiMonitor.getSize()
+            if w >= config.guiWidth and h >= config.guiHeight then
+                state.guiWindow = window.create(state.guiMonitor, 1, 1, w, h, false)
+                state.guiWindow.setBackgroundColor(colors.black)
+                state.guiWindow.setTextColor(colors.white)
+                state.guiWindow.clear()
+                addOutput("[Shell] GUI initialized on monitor '" .. side .. "'")
+                drawGUI()
+                return true
+            end
+        end
+    end
+    
+    addOutput("[Shell] No suitable monitor found for GUI")
+    config.guiEnabled = false
+    return false
+end
+
+-- ============================================================================
+-- Command Execution
+-- ============================================================================
+local function executeExternalCommand(cmd, args)
+    local command = cmd
+    for _, arg in ipairs(args) do
+        command = command .. " " .. arg
+    end
+    
+    local success, result = pcall(function()
+        return shell.run(command)
+    end)
+    
+    if not success then
+        addOutput("Error: " .. tostring(result))
+        return false
+    end
+    return true
+end
+
+local function listFiles(path)
+    path = path or state.currentDir
+    if not fs.exists(path) then
+        addOutput("Directory not found: " .. path)
+        return
+    end
+    
+    local items = fs.list(path)
+    local files = {}
+    local dirs = {}
+    
+    for _, item in ipairs(items) do
+        local fullPath = fs.combine(path, item)
+        if fs.isDir(fullPath) then
+            table.insert(dirs, item .. "/")
+        else
+            table.insert(files, item)
+        end
+    end
+    
+    table.sort(dirs)
+    table.sort(files)
+    
+    for _, dir in ipairs(dirs) do
+        addOutput(dir)
+    end
+    for _, file in ipairs(files) do
+        addOutput(file)
+    end
+end
+
+-- ============================================================================
+-- Built-in Commands
+-- ============================================================================
 local builtins = {
     help = function(args)
-        addOutput("=== Available Commands ===", colors.info)
-        addOutput("  help              - Show this help", colors.text)
-        addOutput("  ls [path]         - List files", colors.text)
-        addOutput("  cd [dir]          - Change directory", colors.text)
-        addOutput("  pwd               - Show current directory", colors.text)
-        addOutput("  clear / cls       - Clear screen", colors.text)
-        addOutput("  echo [text]       - Print text", colors.text)
-        addOutput("  history           - Show command history", colors.text)
-        addOutput("  modem send <target> <port> <msg> - Send modem message", colors.text)
-        addOutput("  modem status      - Show modem status", colors.text)
-        addOutput("  display <text>    - Write to external display", colors.text)
-        addOutput("  display clear     - Clear external display", colors.text)
-        addOutput("  exit / quit       - Exit shell", colors.text)
-        return true
+        addOutput("=== Advanced Shell Commands ===")
+        addOutput("  help                    - Show this help")
+        addOutput("  ls [path]              - List files/directories")
+        addOutput("  cd [dir]               - Change directory")
+        addOutput("  pwd                    - Print working directory")
+        addOutput("  clear / cls            - Clear screen")
+        addOutput("  echo [text]            - Print text")
+        addOutput("  jobs                   - List background jobs")
+        addOutput("  bg [command]           - Run command in background")
+        addOutput("  kill <job_id>          - Kill background job")
+        addOutput("  modem <target> <port> <msg> - Send modem message")
+        addOutput("  display [text]         - Write to external display")
+        addOutput("  history                - Show command history")
+        addOutput("  exit / quit            - Exit shell")
     end,
     
     ls = function(args)
-        local path = args[1] or state.currentDir
-        if not fs.exists(path) then
-            addOutput("Path not found: " .. path, colors.error)
-            return true
-        end
-        
-        local files = fs.list(path)
-        if #files == 0 then
-            addOutput("Directory is empty", colors.warning)
-            return true
-        end
-        
-        table.sort(files)
-        for _, file in ipairs(files) do
-            local fullPath = fs.combine(path, file)
-            if fs.isDir(fullPath) then
-                addOutput(file .. "/", colors.info)
-            else
-                addOutput(file, colors.text)
-            end
-        end
-        return true
+        listFiles(args[1])
+    end,
+    
+    dir = function(args)
+        listFiles(args[1])
     end,
     
     cd = function(args)
@@ -308,100 +399,120 @@ local builtins = {
         if fs.isDir(newDir) then
             shell.setDir(newDir)
             state.currentDir = shell.dir()
-            addOutput("Changed to: " .. state.currentDir, colors.success)
-        elseif newDir == ".." then
-            shell.setDir(shell.dir() .. "/..")
-            state.currentDir = shell.dir()
-            addOutput("Changed to: " .. state.currentDir, colors.success)
+            addOutput("Changed to: " .. state.currentDir)
         else
-            addOutput("Directory not found: " .. newDir, colors.error)
+            addOutput("Directory not found: " .. newDir)
         end
-        return true
     end,
     
     pwd = function(args)
-        addOutput(state.currentDir, colors.info)
-        return true
+        addOutput(state.currentDir)
     end,
     
     clear = function(args)
-        clearScreen()
-        state.outputLines = {}
-        return true
+        clearOutput()
     end,
     
     cls = function(args)
-        return builtins.clear(args)
+        clearOutput()
     end,
     
     echo = function(args)
         local text = table.concat(args, " ")
-        addOutput(text, colors.text)
+        addOutput(text)
         if state.display then
-            writeToDisplay(text .. "\n")
+            displayWrite(text .. "\n")
         end
-        return true
     end,
     
-    history = function(args)
-        for i = math.max(1, #state.history - 20), #state.history do
-            addOutput(string.format("%5d  %s", i, state.history[i]), colors.text)
+    jobs = function(args)
+        if next(state.backgroundJobs) == nil then
+            addOutput("No active background jobs")
+        else
+            addOutput("Active background jobs:")
+            for id, job in pairs(state.backgroundJobs) do
+                addOutput("  [" .. id .. "] " .. job.command)
+            end
         end
-        return true
+    end,
+    
+    bg = function(args)
+        local command = table.concat(args, " ")
+        if command == "" then
+            addOutput("Usage: bg <command>")
+            return
+        end
+        
+        local jobId = state.nextJobId
+        state.nextJobId = state.nextJobId + 1
+        state.backgroundJobs[jobId] = {command = command, running = true}
+        addOutput("[Job #" .. jobId .. "] Started: " .. command)
+        
+        parallel.waitForAny(function()
+            os.sleep(0.1)
+            local success, err = pcall(function()
+                shell.run(command)
+            end)
+            if state.backgroundJobs[jobId] then
+                state.backgroundJobs[jobId] = nil
+                if not success then
+                    addOutput("[Job #" .. jobId .. "] Error: " .. tostring(err))
+                else
+                    addOutput("[Job #" .. jobId .. "] Completed")
+                end
+            end
+        end)
+    end,
+    
+    kill = function(args)
+        local jobId = tonumber(args[1])
+        if not jobId or not state.backgroundJobs[jobId] then
+            addOutput("Job not found: " .. tostring(args[1]))
+            return
+        end
+        state.backgroundJobs[jobId] = nil
+        addOutput("[Job #" .. jobId .. "] Killed")
     end,
     
     modem = function(args)
-        if #args == 0 then
-            addOutput("Usage: modem send <target> <port> <message>", colors.warning)
-            addOutput("       modem status", colors.warning)
-            return true
+        if #args < 3 then
+            addOutput("Usage: modem <target> <port> <message>")
+            addOutput("Example: modem @Everyone 12345 Hello")
+            return
         end
-        
-        if args[1] == "status" then
-            if state.modem then
-                addOutput("Modem: Connected on port " .. config.modemPort, colors.success)
-            else
-                addOutput("Modem: Not connected", colors.error)
-            end
-            return true
-        elseif args[1] == "send" and #args >= 4 then
-            local target = args[2]
-            local port = tonumber(args[3])
-            local message = table.concat(args, " ", 4)
-            sendModemMessage(target, port, message)
-            return true
-        else
-            addOutput("Invalid modem command", colors.error)
-            return true
-        end
+        local target = args[1]
+        local port = tonumber(args[2])
+        local message = table.concat(args, " ", 3)
+        modemSend(target, port, message)
     end,
     
     display = function(args)
-        if not state.display then
-            addOutput("No display connected", colors.error)
-            return true
+        local text = table.concat(args, " ")
+        if text == "" then
+            addOutput("Usage: display <text>")
+            return
         end
-        
-        if #args == 0 then
-            addOutput("Usage: display <text>", colors.warning)
-            addOutput("       display clear", colors.warning)
-            return true
+        displayWrite(text .. "\n")
+    end,
+    
+    history = function(args)
+        for i, cmd in ipairs(state.history) do
+            addOutput(string.format("%3d: %s", i, cmd))
         end
-        
-        if args[1] == "clear" then
-            state.display.clear()
-            addOutput("Display cleared", colors.success)
-        else
-            local text = table.concat(args, " ")
-            writeToDisplay(text .. "\n")
-            addOutput("Sent to display: " .. text, colors.success)
-        end
-        return true
     end,
     
     exit = function(args)
-        addOutput("Goodbye!", colors.info)
+        addOutput("Goodbye!")
         state.running = false
+        saveHistory()
+        if state.modem then
+            state.modem.close(config.modemPort)
+        end
+        if state.guiWindow then
+            state.guiWindow.clear()
+            state.guiWindow.setCursorPos(1, 1)
+            state.guiWindow.write("Shell closed. Press any key to exit...")
+        end
         return false
     end,
     
@@ -410,190 +521,230 @@ local builtins = {
     end
 }
 
--- Execute command
-local function executeCommand(input)
-    if input == "" then return true end
-    
-    addToHistory(input)
-    
-    -- Parse command
-    local args = {}
-    for arg in input:gmatch("%S+") do
-        table.insert(args, arg)
-    end
-    
-    local command = args[1]
-    table.remove(args, 1)
-    
-    -- Check builtin commands
-    if builtins[command] then
-        return builtins[command](args)
-    else
-        -- Try to run as external program
-        local success, result = pcall(function()
-            return shell.run(input)
-        end)
+-- ============================================================================
+-- Input Handling
+-- ============================================================================
+local function handleInput(char)
+    if char == string.char(13) then -- Enter
+        addOutput(config.prompt .. state.inputBuffer)
+        local cmd = state.inputBuffer
+        state.inputBuffer = ""
+        state.cursorPos = 0
         
-        if not success then
-            addOutput("Command not found: " .. command, colors.error)
-            addOutput("Type 'help' for available commands", colors.warning)
+        if cmd ~= "" then
+            addToHistory(cmd)
+            local args = splitString(cmd)
+            local command = table.remove(args, 1)
+            
+            if builtins[command] then
+                local result = builtins[command](args)
+                if result == false then
+                    return false
+                end
+            else
+                executeExternalCommand(command, args)
+            end
         end
-        return true
-    end
-end
-
--- Handle input
-local function handleInput()
-    local eventData = {os.pullEvent()}
-    local event = eventData[1]
-    
-    if event == "key" then
-        local key = eventData[2]
         
-        -- Enter key
-        if key == keys.enter then
-            if state.currentInput ~= "" then
-                addOutput(config.prompt .. state.currentInput, colors.prompt)
-                executeCommand(state.currentInput)
-                state.currentInput = ""
-                state.cursorPos = 0
-                clearInputLine()
-                drawPrompt()
-            end
-        -- Backspace
-        elseif key == keys.backspace then
-            if state.cursorPos > 0 then
-                state.currentInput = state.currentInput:sub(1, state.cursorPos-1) .. 
-                                    state.currentInput:sub(state.cursorPos+1)
-                state.cursorPos = state.cursorPos - 1
-                clearInputLine()
-                drawPrompt()
-            end
-        -- Delete
-        elseif key == keys.delete then
-            if state.cursorPos < #state.currentInput then
-                state.currentInput = state.currentInput:sub(1, state.cursorPos) .. 
-                                    state.currentInput:sub(state.cursorPos+2)
-                clearInputLine()
-                drawPrompt()
-            end
-        -- Left arrow
-        elseif key == keys.left then
-            if state.cursorPos > 0 then
-                state.cursorPos = state.cursorPos - 1
-                drawPrompt()
-            end
-        -- Right arrow
-        elseif key == keys.right then
-            if state.cursorPos < #state.currentInput then
-                state.cursorPos = state.cursorPos + 1
-                drawPrompt()
-            end
-        -- Up arrow (history)
-        elseif key == keys.up then
-            if state.historyIndex > 0 then
-                state.currentInput = state.history[state.historyIndex]
-                state.cursorPos = #state.currentInput
-                state.historyIndex = state.historyIndex - 1
-                clearInputLine()
-                drawPrompt()
-            end
-        -- Down arrow (history)
-        elseif key == keys.down then
-            if state.historyIndex < #state.history then
-                state.historyIndex = state.historyIndex + 1
-                state.currentInput = state.history[state.historyIndex] or ""
-                state.cursorPos = #state.currentInput
-                clearInputLine()
-                drawPrompt()
-            elseif state.historyIndex == #state.history then
-                state.currentInput = ""
-                state.cursorPos = 0
-                state.historyIndex = state.historyIndex + 1
-                clearInputLine()
-                drawPrompt()
-            end
-        -- Home key
-        elseif key == keys.home then
-            state.cursorPos = 0
-            drawPrompt()
-        -- End key
-        elseif key == keys.end then
-            state.cursorPos = #state.currentInput
-            drawPrompt()
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
         end
-    elseif event == "char" then
-        local char = eventData[2]
-        if char and #char == 1 and char:byte() >= 32 then
-            state.currentInput = state.currentInput:sub(1, state.cursorPos) .. char .. 
-                                state.currentInput:sub(state.cursorPos+1)
-            state.cursorPos = state.cursorPos + 1
-            clearInputLine()
-            drawPrompt()
+    elseif char == string.char(8) then -- Backspace
+        if state.cursorPos > 0 then
+            state.inputBuffer = state.inputBuffer:sub(1, state.cursorPos - 1) .. state.inputBuffer:sub(state.cursorPos + 1)
+            state.cursorPos = state.cursorPos - 1
+            if config.guiEnabled and state.guiWindow then
+                drawGUI()
+            end
         end
-    elseif event == "modem_message" then
-        local side, channel, replyChannel, message, distance = eventData[2], eventData[3], eventData[4], eventData[5], eventData[6]
-        addOutput("[Modem] From " .. channel .. ":" .. replyChannel .. " -> " .. tostring(message), colors.info)
-        drawPrompt()
-        return true
+    elseif char:byte() and char:byte() >= 32 then -- Printable characters
+        state.inputBuffer = state.inputBuffer:sub(1, state.cursorPos) .. char .. state.inputBuffer:sub(state.cursorPos + 1)
+        state.cursorPos = state.cursorPos + 1
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
     end
     
     return true
 end
 
--- Main shell loop
-local function shellLoop()
-    clearScreen()
-    addOutput("=== ComputerCraft Advanced Shell ===", colors.info)
-    addOutput("Type 'help' for commands", colors.success)
-    addOutput("Modem and Display support enabled", colors.text)
-    addOutput("", colors.text)
-    
-    drawPrompt()
-    
-    while state.running do
-        local continue = handleInput()
-        if not continue then break end
-        os.sleep(0.05)
+local function handleKey(key)
+    if key == keys.up then -- Up arrow
+        if state.historyIndex > 0 then
+            state.inputBuffer = state.history[state.historyIndex]
+            state.historyIndex = state.historyIndex - 1
+            state.cursorPos = #state.inputBuffer
+            if config.guiEnabled and state.guiWindow then
+                drawGUI()
+            end
+        end
+    elseif key == keys.down then -- Down arrow
+        if state.historyIndex < #state.history then
+            state.historyIndex = state.historyIndex + 1
+            if state.historyIndex == #state.history then
+                state.inputBuffer = ""
+            else
+                state.inputBuffer = state.history[state.historyIndex + 1]
+            end
+            state.cursorPos = #state.inputBuffer
+            if config.guiEnabled and state.guiWindow then
+                drawGUI()
+            end
+        end
+    elseif key == keys.left then -- Left arrow
+        if state.cursorPos > 0 then
+            state.cursorPos = state.cursorPos - 1
+            if config.guiEnabled and state.guiWindow then
+                drawGUI()
+            end
+        end
+    elseif key == keys.right then -- Right arrow
+        if state.cursorPos < #state.inputBuffer then
+            state.cursorPos = state.cursorPos + 1
+            if config.guiEnabled and state.guiWindow then
+                drawGUI()
+            end
+        end
+    elseif key == keys.home then -- Home
+        state.cursorPos = 0
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
+    elseif key == keys["end"] then -- End
+        state.cursorPos = #state.inputBuffer
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
+    elseif key == keys.pageUp then -- Page Up
+        state.scrollOffset = state.scrollOffset + 10
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
+    elseif key == keys.pageDown then -- Page Down
+        state.scrollOffset = math.max(0, state.scrollOffset - 10)
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
     end
 end
 
--- Initialize and start
-local function start()
-    -- Get terminal size
-    state.termW, state.termH = term.getSize()
+-- ============================================================================
+-- Modem Event Handler
+-- ============================================================================
+local function handleModemEvent(event, side, channel, replyChannel, message, distance)
+    if event == "modem_message" then
+        addOutput("\n[Modem] From " .. side .. ":" .. channel .. " -> " .. message)
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+        end
+    end
+end
+
+-- ============================================================================
+-- Main Loop
+-- ============================================================================
+local function mainLoop()
+    -- Register modem event handler
+    if state.modem then
+        os.loadAPI("event")
+        event.listen("modem_message", handleModemEvent)
+    end
     
-    -- Initialize peripherals
+    while state.running do
+        if config.guiEnabled and state.guiWindow then
+            drawGUI()
+            local eventData = {os.pullEvent()}
+            local eventType = eventData[1]
+            
+            if eventType == "key" then
+                local key = eventData[2]
+                if key == keys.enter then
+                    if not handleInput(string.char(13)) then
+                        break
+                    end
+                elseif key == keys.backspace then
+                    handleInput(string.char(8))
+                else
+                    handleKey(key)
+                end
+            elseif eventType == "char" then
+                local char = eventData[2]
+                if not handleInput(char) then
+                    break
+                end
+            elseif eventType == "modem_message" then
+                handleModemEvent(unpack(eventData))
+            end
+        else
+            -- Terminal mode
+            term.write(config.prompt)
+            local input = read()
+            
+            if input then
+                addOutput(config.prompt .. input)
+                
+                if input ~= "" then
+                    addToHistory(input)
+                    local args = splitString(input)
+                    local command = table.remove(args, 1)
+                    
+                    if builtins[command] then
+                        local result = builtins[command](args)
+                        if result == false then
+                            break
+                        end
+                    else
+                        executeExternalCommand(command, args)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- Initialization
+-- ============================================================================
+local function init()
+    print("=== Advanced Shell v" .. version .. " ===")
+    print("Initializing...")
+    
+    loadHistory()
     initModem()
     initDisplay()
     
-    -- Load command history
-    loadHistory()
-    
-    -- Set up modem event handler
-    if state.modem then
-        os.queueEvent("modem_message")
+    -- Try to initialize GUI
+    if config.guiEnabled then
+        initGUI()
     end
     
-    -- Start main loop
-    shellLoop()
-    
-    -- Cleanup
-    saveHistory()
-    if state.modem then
-        state.modem.close(config.modemPort)
-    end
-    if state.display then
-        state.display.clear()
+    if config.guiEnabled and state.guiWindow then
+        print("GUI mode enabled on monitor")
+        addOutput("=== Advanced Shell v" .. version .. " ===")
+        addOutput("Type 'help' for available commands")
+        addOutput("Modem: " .. (state.modem and "Connected" or "Not found"))
+        addOutput("Display: " .. (state.display and "Connected" or "Not found"))
+    else
+        print("Terminal mode enabled")
+        print("Type 'help' for available commands")
+        print("Modem: " .. (state.modem and "Connected" or "Not found"))
+        print("Display: " .. (state.display and "Connected" or "Not found"))
+        print("")
     end
 end
 
--- Run with error handling
+-- ============================================================================
+-- Start Shell
+-- ============================================================================
+local function start()
+    init()
+    mainLoop()
+end
+
+-- Run the shell
 local ok, err = pcall(start)
 if not ok then
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("Error: " .. tostring(err))
+    print("Fatal error: " .. tostring(err))
     print("Press any key to exit...")
     os.pullEvent("key")
 end
